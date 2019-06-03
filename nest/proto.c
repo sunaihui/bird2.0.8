@@ -1968,3 +1968,27 @@ proto_get_named(struct symbol *sym, struct protocol *pr)
 
   return p;
 }
+
+void
+reload_all(void)
+{
+  log(L_INFO "Reloading all protocols.");
+  struct proto *p;
+  WALK_LIST(p, proto_list)
+  {
+    if (!p->disabled && p->proto_state == PS_UP)
+    {
+      log(L_INFO "Reloading protocol %s.", p->name);
+      struct channel *c;
+      WALK_LIST(c, p->channels)
+      {
+        if (channel_reloadable(c) && c->channel_state == CS_UP)
+        {
+          channel_request_reload(c);
+          channel_request_feeding(c);
+        }
+      }
+    }
+  }
+}
+

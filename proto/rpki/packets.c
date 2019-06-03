@@ -827,6 +827,8 @@ rpki_handle_end_of_data_pdu(struct rpki_cache *cache, const struct pdu_end_of_da
   cache->last_update = current_time();
   cache->serial_num = pdu->serial_num;
   rpki_cache_change_state(cache, RPKI_CS_ESTABLISHED);
+
+  reload_all();
 }
 
 /**

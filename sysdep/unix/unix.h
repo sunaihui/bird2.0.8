@@ -10,6 +10,7 @@
 #define _BIRD_UNIX_H_
 
 #include <sys/socket.h>
+#include <signal.h>
 
 struct pool;
 struct iface;
@@ -26,7 +27,9 @@ void cmd_check_config(char *name);
 void cmd_reconfig(char *name, int type, uint timeout);
 void cmd_reconfig_confirm(void);
 void cmd_reconfig_undo(void);
+void cmd_reconfig_status(void);
 void cmd_shutdown(void);
+void cmd_graceful_restart(void);
 
 #define UNIX_DEFAULT_CONFIGURE_TIMEOUT	300
 
@@ -95,9 +98,9 @@ int sockaddr_read(sockaddr *sa, int af, ip_addr *a, struct iface **ifa, uint *po
 #define SUN_LEN(ptr) ((size_t) (((struct sockaddr_un *) 0)->sun_path) + strlen ((ptr)->sun_path))
 #endif
 
-extern volatile int async_config_flag;
-extern volatile int async_dump_flag;
-extern volatile int async_shutdown_flag;
+extern volatile sig_atomic_t async_config_flag;
+extern volatile sig_atomic_t async_dump_flag;
+extern volatile sig_atomic_t async_shutdown_flag;
 
 void io_init(void);
 void io_loop(void);

@@ -38,7 +38,7 @@ struct align_probe { char x; long int y; };
 #define ARRAY_SIZE(a) (sizeof(a)/sizeof(*(a)))
 #define BYTES(n) ((((uint) (n)) + 7) / 8)
 #define CALL(fn, args...) ({ if (fn) fn(args); })
-#define ADVANCE(w, r, l) ({ r -= l; w += l; })
+#define ADVANCE(w, r, l) ({ r -= (l); w += (l); })
 
 static inline int uint_cmp(uint i1, uint i2)
 { return (int)(i1 > i2) - (int)(i1 < i2); }
@@ -72,6 +72,10 @@ static inline int u64_cmp(u64 i1, u64 i2)
 #define NORET __attribute__((noreturn))
 #define UNUSED __attribute__((unused))
 #define PACKED __attribute__((packed))
+
+#ifndef HAVE_THREAD_LOCAL
+#define _Thread_local
+#endif
 
 /* Microsecond time */
 
@@ -162,6 +166,15 @@ void debug(const char *msg, ...);	/* Printf to debug output */
 #define ASSERT(x) do { if (!(x)) bug("Assertion '%s' failed at %s:%d", #x, __FILE__, __LINE__); } while(0)
 #else
 #define ASSERT(x) do { if (!(x)) log(L_BUG "Assertion '%s' failed at %s:%d", #x, __FILE__, __LINE__); } while(0)
+#endif
+
+#ifdef DEBUGGING
+asm(
+    ".pushsection \".debug_gdb_scripts\", \"MS\",@progbits,1\n"
+    ".byte 1\n" /* Python */
+    ".asciz \"bird-gdb.py\"\n"
+    ".popsection\n"
+   );
 #endif
 
 /* Pseudorandom numbers */

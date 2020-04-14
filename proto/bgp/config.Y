@@ -29,7 +29,8 @@ CF_KEYWORDS(BGP, LOCAL, NEIGHBOR, AS, HOLD, TIME, CONNECT, RETRY, KEEPALIVE,
 	SECURITY, DETERMINISTIC, SECONDARY, ALLOW, BFD, ADD, PATHS, RX, TX,
 	GRACEFUL, RESTART, AWARE, CHECK, LINK, PORT, EXTENDED, MESSAGES, SETKEY,
 	STRICT, BIND, CONFEDERATION, MEMBER, MULTICAST, FLOW4, FLOW6, LONG,
-	LIVED, STALE, IMPORT, IBGP, EBGP)
+	LIVED, STALE, IMPORT, IBGP, EBGP, MANDATORY, INTERNAL, EXTERNAL,
+	DYNAMIC, RANGE, NAME, DIGITS, BGP_AIGP, AIGP, ORIGINATE, COST)
 
 %type <i> bgp_nh
 %type <i32> bgp_afi
@@ -68,6 +69,7 @@ bgp_proto_start: proto_start BGP {
      BGP_CFG->llgr_mode = -1;
      BGP_CFG->llgr_time = 3600;
      BGP_CFG->setkey = 1;
+     BGP_CFG->dynamic_name = "dynbgp";
      BGP_CFG->check_link = -1;
    }
  ;
@@ -82,6 +84,8 @@ bgp_nbr_opts:
    /* empty */
  | bgp_nbr_opts PORT expr { BGP_CFG->remote_port = $3; if (($3<1) || ($3>65535)) cf_error("Invalid port number"); }
  | bgp_nbr_opts AS expr { BGP_CFG->remote_as = $3; }
+ | bgp_nbr_opts INTERNAL { BGP_CFG->peer_type = BGP_PT_INTERNAL; }
+ | bgp_nbr_opts EXTERNAL { BGP_CFG->peer_type = BGP_PT_EXTERNAL; }
  ;
 
 bgp_cease_mask:
@@ -118,10 +122,17 @@ bgp_proto:
    }
  | bgp_proto NEIGHBOR bgp_nbr_opts ';'
  | bgp_proto NEIGHBOR ipa ipa_scope bgp_nbr_opts ';' {
-     if (ipa_nonzero(BGP_CFG->remote_ip))
+     if (ipa_nonzero(BGP_CFG->remote_ip) || BGP_CFG->remote_range)
        cf_error("Only one neighbor per BGP instance is allowed");
      BGP_CFG->remote_ip = $3;
      if ($4) BGP_CFG->iface = $4;
+   }
+ | bgp_proto NEIGHBOR RANGE net_ip bgp_nbr_opts ';' {
+     if (ipa_nonzero(BGP_CFG->remote_ip) || BGP_CFG->remote_range)
+       cf_error("Only one neighbor per BGP instance is allowed");
+     net_addr *n = cfg_alloc($4.length);
+     net_copy(n, &($4));
+     BGP_CFG->remote_range = n;
    }
  | bgp_proto INTERFACE TEXT ';' { BGP_CFG->iface = if_get_by_name($3); }
  | bgp_proto RR CLUSTER ID idval ';' { BGP_CFG->rr_cluster_id = $5; }
@@ -134,6 +145,12 @@ bgp_proto:
  | bgp_proto DIRECT ';' { BGP_CFG->multihop = 0; }
  | bgp_proto MULTIHOP ';' { BGP_CFG->multihop = 64; }
  | bgp_proto MULTIHOP expr ';' { BGP_CFG->multihop = $3; if (($3<1) || ($3>255)) cf_error("Multihop must be in range 1-255"); }
+ | bgp_proto DYNAMIC NAME text ';' {
+     if (strchr($4, '%')) cf_error("Forbidden character '%%' in dynamic name");
+     if (strlen($4) > (SYM_MAX_LEN - 16)) cf_error("Dynamic name too long");
+     BGP_CFG->dynamic_name = $4;
+   }
+ | bgp_proto DYNAMIC NAME DIGITS expr ';' { BGP_CFG->dynamic_name_digits = $5; if ($5>10) cf_error("Dynamic name digits must be at most 10"); }
  | bgp_proto STRICT BIND bool ';' { BGP_CFG->strict_bind = $4; }
  | bgp_proto PATH METRIC bool ';' { BGP_CFG->compare_path_lengths = $4; }
  | bgp_proto MED METRIC bool ';' { BGP_CFG->med_metric = $4; }
@@ -210,6 +227,7 @@ bgp_channel_start: bgp_afi
     BGP_CC->gr_able = 0xff;	/* undefined */
     BGP_CC->llgr_able = 0xff;	/* undefined */
     BGP_CC->llgr_time = ~0U;	/* undefined */
+    BGP_CC->aigp = 0xff;	/* undefined */
   }
 };
 
@@ -223,6 +241,7 @@ bgp_channel_item:
  | NEXT HOP ADDRESS ipa { BGP_CC->next_hop_addr = $4; }
  | NEXT HOP SELF bgp_nh { BGP_CC->next_hop_self = $4; }
  | NEXT HOP KEEP bgp_nh { BGP_CC->next_hop_keep = $4; }
+ | MANDATORY bool { BGP_CC->mandatory = $2; }
  | MISSING LLADDR SELF { BGP_CC->missing_lladdr = MLL_SELF; }
  | MISSING LLADDR DROP { BGP_CC->missing_lladdr = MLL_DROP; }
  | MISSING LLADDR IGNORE { BGP_CC->missing_lladdr = MLL_IGNORE; }
@@ -237,6 +256,10 @@ bgp_channel_item:
  | ADD PATHS TX { BGP_CC->add_path = BGP_ADD_PATH_TX; }
  | ADD PATHS bool { BGP_CC->add_path = $3 ? BGP_ADD_PATH_FULL : 0; }
  | IMPORT TABLE bool { BGP_CC->import_table = $3; }
+ | EXPORT TABLE bool { BGP_CC->export_table = $3; }
+ | AIGP bool { BGP_CC->aigp = $2; BGP_CC->aigp_originate = 0; }
+ | AIGP ORIGINATE { BGP_CC->aigp = 1; BGP_CC->aigp_originate = 1; }
+ | COST expr { BGP_CC->cost = $2; if ($2 < 1) cf_error("Cost must be positive"); }
  | IGP TABLE rtable {
     if (BGP_CC->desc->no_igp)
       cf_error("IGP table not allowed here");
@@ -284,7 +307,7 @@ dynamic_attr: BGP_LOCAL_PREF
 dynamic_attr: BGP_ATOMIC_AGGR
 	{ $$ = f_new_dynamic_attr(EAF_TYPE_OPAQUE, T_ENUM_EMPTY, EA_CODE(PROTOCOL_BGP, BA_ATOMIC_AGGR)); } ;
 dynamic_attr: BGP_AGGREGATOR
-	{ $$ = f_new_dynamic_attr(EAF_TYPE_INT, T_INT, EA_CODE(PROTOCOL_BGP, BA_AGGREGATOR)); } ;
+	{ $$ = f_new_dynamic_attr(EAF_TYPE_OPAQUE, T_ENUM_EMPTY, EA_CODE(PROTOCOL_BGP, BA_AGGREGATOR)); } ;
 dynamic_attr: BGP_COMMUNITY
 	{ $$ = f_new_dynamic_attr(EAF_TYPE_INT_SET, T_CLIST, EA_CODE(PROTOCOL_BGP, BA_COMMUNITY)); } ;
 dynamic_attr: BGP_ORIGINATOR_ID
@@ -293,6 +316,8 @@ dynamic_attr: BGP_CLUSTER_LIST
 	{ $$ = f_new_dynamic_attr(EAF_TYPE_INT_SET, T_CLIST, EA_CODE(PROTOCOL_BGP, BA_CLUSTER_LIST)); } ;
 dynamic_attr: BGP_EXT_COMMUNITY
 	{ $$ = f_new_dynamic_attr(EAF_TYPE_EC_SET, T_ECLIST, EA_CODE(PROTOCOL_BGP, BA_EXT_COMMUNITY)); } ;
+dynamic_attr: BGP_AIGP
+	{ $$ = f_new_dynamic_attr(EAF_TYPE_OPAQUE, T_ENUM_EMPTY, EA_CODE(PROTOCOL_BGP, BA_AIGP)); } ;
 dynamic_attr: BGP_LARGE_COMMUNITY
 	{ $$ = f_new_dynamic_attr(EAF_TYPE_LC_SET, T_LCLIST, EA_CODE(PROTOCOL_BGP, BA_LARGE_COMMUNITY)); } ;
 

@@ -39,9 +39,14 @@
 #include "lib/string.h"
 #include "conf/conf.h"
 #include "filter/filter.h"
+#include "filter/data.h"
 #include "lib/hash.h"
 #include "lib/string.h"
 #include "lib/alloca.h"
+
+#ifdef CONFIG_BGP
+#include "proto/bgp/bgp.h"
+#endif
 
 pool *rt_table_pool;
 
@@ -567,7 +572,7 @@ static rte *
 export_filter_(struct channel *c, rte *rt0, rte **rt_free, linpool *pool, int silent)
 {
   struct proto *p = c->proto;
-  struct filter *filter = c->out_filter.filter;
+  const struct filter *filter = c->out_filter.filter;
   struct proto_stats *stats = &c->stats;
   rte *rt;
   int v;
@@ -632,7 +637,6 @@ do_rt_notify(struct channel *c, net *net, rte *new, rte *old, int refeed)
   struct proto *p = c->proto;
   struct proto_stats *stats = &c->stats;
 
-
   /*
    * First, apply export limit.
    *
@@ -678,6 +682,8 @@ do_rt_notify(struct channel *c, net *net, rte *new, rte *old, int refeed)
 	}
     }
 
+  if (c->out_table && !rte_update_out(c, net->n.addr, new, old, refeed))
+    return;
 
   if (new)
     stats->exp_updates_accepted++;
@@ -1546,7 +1552,7 @@ rte_update2(struct channel *c, const net_addr *n, rte *new, struct rte_src *src)
 {
   struct proto *p = c->proto;
   struct proto_stats *stats = &c->stats;
-  struct filter *filter = c->in_filter.filter;
+  const struct filter *filter = c->in_filter.filter;
   rte *dummy = NULL;
   net *nn;
 
@@ -1587,7 +1593,7 @@ rte_update2(struct channel *c, const net_addr *n, rte *new, struct rte_src *src)
 	}
       else if (filter)
 	{
-	  rta *old_attrs;
+	  rta *old_attrs = NULL;
 	  rte_make_tmp_attrs(&new, rte_update_pool, &old_attrs);
 
 	  int fr = f_run(&(c->in_filter), &new, rte_update_pool, 0);
@@ -2116,11 +2122,13 @@ no_nexthop:
     else
     {
       nhr = nhp;
-      nhp = (nhp ? (nhp->next = lp_allocz(rte_update_pool, NEXTHOP_MAX_SIZE)) : &(a->nh));
+      nhp = (nhp ? (nhp->next = lp_alloc(rte_update_pool, NEXTHOP_MAX_SIZE)) : &(a->nh));
     }
 
+    memset(nhp, 0, NEXTHOP_MAX_SIZE);
     nhp->iface = nh->iface;
     nhp->weight = nh->weight;
+
     if (mls)
     {
       nhp->labels = nh->labels + mls->len;
@@ -2138,11 +2146,20 @@ no_nexthop:
 	continue;
       }
     }
+    else if (nh->labels)
+    {
+      nhp->labels = nh->labels;
+      nhp->labels_orig = 0;
+      memcpy(nhp->label, nh->label, nh->labels * sizeof(u32));
+    }
+
     if (ipa_nonzero(nh->gw))
     {
       nhp->gw = nh->gw;			/* Router nexthop */
       nhp->flags |= (nh->flags & RNF_ONLINK);
     }
+    else if (!(nh->iface->flags & IF_MULTIACCESS) || (nh->iface->flags & IF_LOOPBACK))
+      nhp->gw = IPA_NONE;		/* PtP link - no need for nexthop */
     else if (ipa_nonzero(he->link))
       nhp->gw = he->link;		/* Device nexthop with link-local address known */
     else
@@ -2292,13 +2309,13 @@ rt_new_table(struct symbol *s, uint addr_type)
 {
   /* Hack that allows to 'redefine' the master table */
   if ((s->class == SYM_TABLE) &&
-      (s->def == new_config->def_tables[addr_type]) &&
+      (s->table == new_config->def_tables[addr_type]) &&
       ((addr_type == NET_IP4) || (addr_type == NET_IP6)))
-    return s->def;
+    return s->table;
 
   struct rtable_config *c = cfg_allocz(sizeof(struct rtable_config));
 
-  cf_define_symbol(s, SYM_TABLE, c);
+  cf_define_symbol(s, SYM_TABLE, table, c);
   c->name = s->name;
   c->addr_type = addr_type;
   c->gc_max_ops = 1000;
@@ -2358,7 +2375,7 @@ static struct rtable_config *
 rt_find_table_config(struct config *cf, char *name)
 {
   struct symbol *sym = cf_find_symbol(cf, name);
-  return (sym && (sym->class == SYM_TABLE)) ? sym->def : NULL;
+  return (sym && (sym->class == SYM_TABLE)) ? sym->table : NULL;
 }
 
 /**
@@ -2520,6 +2537,10 @@ rt_feed_channel_abort(struct channel *c)
 }
 
 
+/*
+ *	Import table
+ */
+
 int
 rte_update_in(struct channel *c, const net_addr *n, rte *new, struct rte_src *src)
 {
@@ -2560,6 +2581,10 @@ rte_update_in(struct channel *c, const net_addr *n, rte *new, struct rte_src *sr
 
 	goto drop_update;
       }
+
+      /* Move iterator if needed */
+      if (old == c->reload_next_rte)
+	c->reload_next_rte = old->next;
 
       /* Remove the old rte */
       *pos = old->next;
@@ -2628,21 +2653,32 @@ rt_reload_channel(struct channel *c)
     c->reload_active = 1;
   }
 
-  FIB_ITERATE_START(&tab->fib, fit, net, n)
-  {
-    if (max_feed <= 0)
+  do {
+    for (rte *e = c->reload_next_rte; e; e = e->next)
     {
-      FIB_ITERATE_PUT(fit);
-      return 0;
+      if (max_feed-- <= 0)
+      {
+	c->reload_next_rte = e;
+	debug("%s channel reload burst split (max_feed=%d)", c->proto->name, max_feed);
+	return 0;
+      }
+
+      rte_update2(c, e->net->n.addr, rte_do_cow(e), e->attrs->src);
     }
 
-    for (rte *e = n->routes; e; e = e->next)
+    c->reload_next_rte = NULL;
+
+    FIB_ITERATE_START(&tab->fib, fit, net, n)
     {
-      rte_update2(c, n->n.addr, rte_do_cow(e), e->attrs->src);
-      max_feed--;
+      if (c->reload_next_rte = n->routes)
+      {
+	FIB_ITERATE_PUT_NEXT(fit, &tab->fib);
+	break;
+      }
     }
+    FIB_ITERATE_END;
   }
-  FIB_ITERATE_END;
+  while (c->reload_next_rte);
 
   c->reload_active = 0;
   return 1;
@@ -2655,6 +2691,7 @@ rt_reload_channel_abort(struct channel *c)
   {
     /* Unlink the iterator */
     fit_get(&c->in_table->fib, &c->reload_fit);
+    c->reload_next_rte = NULL;
     c->reload_active = 0;
   }
 }
@@ -2680,6 +2717,94 @@ rt_prune_sync(rtable *t, int all)
   FIB_WALK_END;
 }
 
+
+/*
+ *	Export table
+ */
+
+int
+rte_update_out(struct channel *c, const net_addr *n, rte *new, rte *old0, int refeed)
+{
+  struct rtable *tab = c->out_table;
+  struct rte_src *src;
+  rte *old, **pos;
+  net *net;
+
+  if (new)
+  {
+    net = net_get(tab, n);
+    src = new->attrs->src;
+
+    rte_store_tmp_attrs(new, rte_update_pool, NULL);
+
+    if (!rta_is_cached(new->attrs))
+      new->attrs = rta_lookup(new->attrs);
+  }
+  else
+  {
+    net = net_find(tab, n);
+    src = old0->attrs->src;
+
+    if (!net)
+      goto drop_withdraw;
+  }
+
+  /* Find the old rte */
+  for (pos = &net->routes; old = *pos; pos = &old->next)
+    if (old->attrs->src == src)
+    {
+      if (new && rte_same(old, new))
+      {
+	/* REF_STALE / REF_DISCARD not used in export table */
+	/*
+	if (old->flags & (REF_STALE | REF_DISCARD | REF_MODIFY))
+	{
+	  old->flags &= ~(REF_STALE | REF_DISCARD | REF_MODIFY);
+	  return 1;
+	}
+	*/
+
+	goto drop_update;
+      }
+
+      /* Remove the old rte */
+      *pos = old->next;
+      rte_free_quick(old);
+      tab->rt_count--;
+
+      break;
+    }
+
+  if (!new)
+  {
+    if (!old)
+      goto drop_withdraw;
+
+    return 1;
+  }
+
+  /* Insert the new rte */
+  rte *e = rte_do_cow(new);
+  e->flags |= REF_COW;
+  e->net = net;
+  e->sender = c;
+  e->lastmod = current_time();
+  e->next = *pos;
+  *pos = e;
+  tab->rt_count++;
+  return 1;
+
+drop_update:
+  return refeed;
+
+drop_withdraw:
+  return 0;
+}
+
+
+/*
+ *	Hostcache
+ */
 
 static inline u32
 hc_hash(ip_addr a, rtable *dep)
@@ -2838,7 +2963,7 @@ if_local_addr(ip_addr a, struct iface *i)
   return 0;
 }
 
-static u32
+u32
 rt_get_igp_metric(rte *rt)
 {
   eattr *ea = ea_find(rt->attrs->eattrs, EA_GEN_IGP_METRIC);
@@ -2858,6 +2983,14 @@ rt_get_igp_metric(rte *rt)
 #ifdef CONFIG_RIP
   if (a->source == RTS_RIP)
     return rt->u.rip.metric;
+#endif
+
+#ifdef CONFIG_BGP
+  if (a->source == RTS_BGP)
+  {
+    u64 metric = bgp_total_aigp_metric(rt);
+    return (u32) MIN(metric, (u64) IGP_METRIC_UNKNOWN);
+  }
 #endif
 
   if (a->source == RTS_DEVICE)

@@ -91,6 +91,7 @@ void protos_build(void);
 void proto_build(struct protocol *);
 void protos_preconfig(struct config *);
 void protos_commit(struct config *new, struct config *old, int force_restart, int type);
+struct proto * proto_spawn(struct proto_config *cf, uint disabled);
 void protos_dump_all(void);
 
 #define GA_UNKNOWN	0		/* Attribute not recognized */
@@ -115,11 +116,13 @@ struct proto_config {
   struct config *global;		/* Global configuration data */
   struct protocol *protocol;		/* Protocol */
   struct proto *proto;			/* Instance we've created */
+  struct proto_config *parent;		/* Parent proto_config for dynamic protocols */
   char *name;
   char *dsc;
   int class;				/* SYM_PROTO or SYM_TEMPLATE */
   u8 net_type;				/* Protocol network type (NET_*), 0 for undefined */
   u8 disabled;				/* Protocol enabled/disabled by default */
+  u8 vrf_set;				/* Related VRF instance (below) is defined */
   u32 debug, mrtdump;			/* Debugging bitfields, both use D_* constants */
   u32 router_id;			/* Protocol specific router ID */
 
@@ -176,6 +179,7 @@ struct proto {
   uint active_channels;			/* Number of active channels */
   byte net_type;			/* Protocol network type (NET_*), 0 for undefined */
   byte disabled;			/* Manually disabled */
+  byte vrf_set;				/* Related VRF instance (above) is defined */
   byte proto_state;			/* Protocol state machine (PS_*, see below) */
   byte active;				/* From PS_START to cleanup after PS_STOP */
   byte do_start;			/* Start actions are scheduled */
@@ -257,6 +261,7 @@ struct proto_spec {
 #define PDC_CMD_DISABLE		0x11	/* Result of disable command */
 #define PDC_CMD_RESTART		0x12	/* Result of restart command */
 #define PDC_CMD_SHUTDOWN	0x13	/* Result of global shutdown */
+#define PDC_CMD_GR_DOWN		0x14	/* Result of global graceful restart */
 #define PDC_RX_LIMIT_HIT	0x21	/* Route receive limit reached */
 #define PDC_IN_LIMIT_HIT	0x22	/* Route import limit reached */
 #define PDC_OUT_LIMIT_HIT	0x23	/* Route export limit reached */
@@ -265,6 +270,7 @@ struct proto_spec {
 void *proto_new(struct proto_config *);
 void *proto_config_new(struct protocol *, int class);
 void proto_copy_config(struct proto_config *dest, struct proto_config *src);
+void proto_clone_config(struct symbol *sym, struct proto_config *parent);
 void proto_set_message(struct proto *p, char *msg, int len);
 
 void graceful_restart_recovery(void);
@@ -447,7 +453,7 @@ struct channel_class {
   uint config_size;			/* Size of channel config data structure */
 
   void (*init)(struct channel *, struct channel_config *);	/* Create new instance */
-  int (*reconfigure)(struct channel *, struct channel_config *);	/* Try to reconfigure instance, returns success */
+  int (*reconfigure)(struct channel *, struct channel_config *, int *import_changed, int *export_changed);	/* Try to reconfigure instance, returns success */
   int (*start)(struct channel *);	/* Start the instance */
   void (*shutdown)(struct channel *);	/* Stop the instance */
   void (*cleanup)(struct channel *);	/* Channel finished flush */
@@ -479,7 +485,7 @@ struct channel_config {
 
   struct proto_config *parent;		/* Where channel is defined (proto or template) */
   struct rtable_config *table;		/* Table we're attached to */
-  struct filter *in_filter, *out_filter; /* Attached filters */
+  const struct filter *in_filter, *out_filter; /* Attached filters */
   struct channel_limit rx_limit;	/* Limit for receiving routes from protocol
 					   (relevant when in_keep_filtered is active) */
   struct channel_limit in_limit;	/* Limit for importing routes from protocol */
@@ -501,8 +507,8 @@ struct channel {
   struct proto *proto;
 
   struct rtable *table;
-  struct filter_slot in_filter;		/* Input filter */
-  struct filter_slot out_filter;	/* Output filter */
+  struct filter_slot in_filter;         /* Input filter */
+  struct filter_slot out_filter;        /* Output filter */
   struct channel_limit rx_limit;	/* Receive limit (for in_keep_filtered) */
   struct channel_limit in_limit;	/* Input limit */
   struct channel_limit out_limit;	/* Output limit */
@@ -533,8 +539,11 @@ struct channel {
 
   struct rtable *in_table;		/* Internal table for received routes */
   struct event *reload_event;		/* Event responsible for reloading from in_table */
-  struct fib_iterator reload_fit;	/* Iterator in in_table used during reloading */
+  struct fib_iterator reload_fit;	/* FIB iterator in in_table used during reloading */
+  struct rte *reload_next_rte;		/* Route iterator in in_table used during reloading */
   u8 reload_active;			/* Iterator reload_fit is linked */
+
+  struct rtable *out_table;		/* Internal table for exported routes */
 };
 
 
@@ -603,6 +612,7 @@ int proto_configure_channel(struct proto *p, struct channel **c, struct channel_
 
 void channel_set_state(struct channel *c, uint state);
 void channel_setup_in_table(struct channel *c);
+void channel_setup_out_table(struct channel *c);
 void channel_schedule_reload(struct channel *c);
 
 static inline void channel_init(struct channel *c) { channel_set_state(c, CS_START); }

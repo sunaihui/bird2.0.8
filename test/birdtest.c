@@ -4,12 +4,14 @@
  *	Can be freely distributed and used under the terms of the GNU GPL.
  */
 
+#include <inttypes.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <sys/ioctl.h>
@@ -31,9 +33,15 @@
 static const char *request;
 static int list_tests;
 static int do_core;
+static int do_die;
 static int no_fork;
 static int no_timeout;
 static int is_terminal;		/* Whether stdout is a live terminal or pipe redirect */
+
+volatile sig_atomic_t async_config_flag;		/* Asynchronous reconfiguration/dump scheduled */
+volatile sig_atomic_t async_dump_flag;
+volatile sig_atomic_t async_shutdown_flag;
+
 
 uint bt_verbose;
 const char *bt_filename;
@@ -43,23 +51,19 @@ int bt_result;			/* Overall program run result */
 int bt_suite_result;		/* One suit result */
 char bt_out_fmt_buf[1024];	/* Temporary memory buffer for output of testing function */
 
-long int
-bt_random(void)
-{
-  /* Seeded in bt_init() */
-  long int rand_low, rand_high;
+struct timespec bt_begin, bt_suite_begin, bt_suite_case_begin;
 
-  rand_low = random();
-  rand_high = random();
-  return (rand_low & 0xffff) | ((rand_high & 0xffff) << 16);
-}
+u64 bt_random_state[] = {
+  0x80241f302bd4d95d, 0xd10ba2e910f772b, 0xea188c9046f507c5, 0x4c4c581f04e6da05,
+  0x53d9772877c1b647, 0xab8ce3eb466de6c5, 0xad02844c8a8e865f, 0xe8cc78080295065d
+};
 
 void
 bt_init(int argc, char *argv[])
 {
   int c;
 
-  srandom(BT_RANDOM_SEED);
+  initstate(BT_RANDOM_SEED, (char *) bt_random_state, sizeof(bt_random_state));
 
   bt_verbose = 0;
   bt_filename = argv[0];
@@ -67,7 +71,7 @@ bt_init(int argc, char *argv[])
   bt_test_id = NULL;
   is_terminal = isatty(fileno(stdout));
 
-  while ((c = getopt(argc, argv, "lcftv")) >= 0)
+  while ((c = getopt(argc, argv, "lcdftv")) >= 0)
     switch (c)
     {
       case 'l':
@@ -76,6 +80,10 @@ bt_init(int argc, char *argv[])
 
       case 'c':
 	do_core = 1;
+	break;
+
+      case 'd':
+	do_die = 1;
 	break;
 
       case 'f':
@@ -108,13 +116,16 @@ bt_init(int argc, char *argv[])
     bt_syscall(rv < 0, "setrlimit RLIMIT_CORE");
   }
 
+  clock_gettime(CLOCK_MONOTONIC, &bt_begin);
+
   return;
 
  usage:
-  printf("Usage: %s [-l] [-c] [-f] [-t] [-vvv] [<test_suit_name>]\n", argv[0]);
+  printf("Usage: %s [-l] [-c] [-d] [-f] [-t] [-vvv] [<test_suit_name>]\n", argv[0]);
   printf("Options: \n");
   printf("  -l   List all test suite names and descriptions \n");
   printf("  -c   Force unlimit core dumps (needs root privileges) \n");
+  printf("  -d	 Die on first failed test case \n");
   printf("  -f   No forking \n");
   printf("  -t   No timeout limit \n");
   printf("  -v   More verbosity, maximum is 3 -vvv \n");
@@ -155,10 +166,7 @@ int bt_run_test_fn(int (*fn)(const void *), const void *fn_arg, int timeout)
   int result;
   alarm(timeout);
 
-  if (fn_arg)
-    result = fn(fn_arg);
-  else
-    result = ((int (*)(void))fn)();
+  result = fn(fn_arg);
 
   if (!bt_suite_result)
     result = 0;
@@ -185,19 +193,23 @@ get_num_terminal_cols(void)
  * levels.
  */
 static void
-bt_log_result(int result, const char *fmt, va_list argptr)
+bt_log_result(int result, u64 time, const char *fmt, va_list argptr)
 {
   static char msg_buf[BT_BUFFER_SIZE];
   char *pos;
 
-  snprintf(msg_buf, sizeof(msg_buf), "%s%s%s%s",
+  snprintf(msg_buf, sizeof(msg_buf), "%s%s%s%s %" PRIu64 ".%09" PRIu64 "s",
 	   bt_filename,
 	   bt_test_id ? ": " : "",
 	   bt_test_id ? bt_test_id : "",
-	   (fmt && strlen(fmt) > 0) ? ": " : "");
+	   (fmt && strlen(fmt) > 0) ? ": " : "",
+	   time / 1000000000,
+	   time % 1000000000
+	   );
   pos = msg_buf + strlen(msg_buf);
 
-  vsnprintf(pos, sizeof(msg_buf) - (pos - msg_buf), fmt, argptr);
+  if (fmt)
+    vsnprintf(pos, sizeof(msg_buf) - (pos - msg_buf), fmt, argptr);
 
   int chrs = 0;
   for (uint i = 0; i < strlen(msg_buf); i += get_num_terminal_cols())
@@ -226,6 +238,18 @@ bt_log_result(int result, const char *fmt, va_list argptr)
     result_str = is_terminal ? BT_PROMPT_FAIL : BT_PROMPT_FAIL_NO_COLOR;
 
   printf("%s\n", result_str);
+
+  if (do_die && !result)
+    abort();
+}
+
+static u64
+get_time_diff(struct timespec *begin)
+{
+  struct timespec end;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  return (end.tv_sec - begin->tv_sec) * 1000000000ULL
+    + end.tv_nsec - begin->tv_nsec;
 }
 
 /**
@@ -241,7 +265,7 @@ bt_log_overall_result(int result, const char *fmt, ...)
 {
   va_list argptr;
   va_start(argptr, fmt);
-  bt_log_result(result, fmt, argptr);
+  bt_log_result(result, get_time_diff(&bt_begin), fmt, argptr);
   va_end(argptr);
 }
 
@@ -256,11 +280,11 @@ bt_log_overall_result(int result, const char *fmt, ...)
 void
 bt_log_suite_result(int result, const char *fmt, ...)
 {
-  if(bt_verbose >= BT_VERBOSE_SUITE || !result)
+  if (bt_verbose >= BT_VERBOSE_SUITE || !result)
   {
     va_list argptr;
     va_start(argptr, fmt);
-    bt_log_result(result, fmt, argptr);
+    bt_log_result(result, get_time_diff(&bt_suite_begin), fmt, argptr);
     va_end(argptr);
   }
 }
@@ -280,7 +304,7 @@ bt_log_suite_case_result(int result, const char *fmt, ...)
   {
     va_list argptr;
     va_start(argptr, fmt);
-    bt_log_result(result, fmt, argptr);
+    bt_log_result(result, get_time_diff(&bt_suite_case_begin), fmt, argptr);
     va_end(argptr);
   }
 }
@@ -313,6 +337,8 @@ bt_test_suite_base(int (*fn)(const void *), const char *id, const void *fn_arg, 
 
   if (bt_verbose >= BT_VERBOSE_ABSOLUTELY_ALL)
     bt_log("Starting");
+
+  clock_gettime(CLOCK_MONOTONIC, &bt_suite_begin);
 
   if (!forked)
   {
@@ -391,6 +417,9 @@ bt_assert_batch__(struct bt_batch *opts)
   int i;
   for (i = 0; i < opts->ndata; i++)
   {
+    if (bt_verbose >= BT_VERBOSE_SUITE)
+      clock_gettime(CLOCK_MONOTONIC, &bt_suite_case_begin);
+
     int bt_suit_case_result = opts->test_fn(opts->out_buf, opts->data[i].in, opts->data[i].out);
 
     if (bt_suit_case_result == 0)
@@ -486,6 +515,8 @@ void cmd_check_config(char *name UNUSED) {}
 void cmd_reconfig(char *name UNUSED, int type UNUSED, int timeout UNUSED) {}
 void cmd_reconfig_confirm(void) {}
 void cmd_reconfig_undo(void) {}
+void cmd_reconfig_status(void) {}
+void cmd_graceful_restart(void) {}
 void cmd_shutdown(void) {}
 void cmd_reconfig_undo_notify(void) {}
 

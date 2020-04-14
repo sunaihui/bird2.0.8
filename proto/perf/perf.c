@@ -90,6 +90,8 @@ struct perf_random_routes {
   struct rta a;
 };
 
+static const uint perf_random_routes_size = sizeof(struct perf_random_routes) + (RTA_MAX_SIZE - sizeof(struct rta));
+
 static inline s64 timediff(struct timespec *begin, struct timespec *end)
 { return (end->tv_sec - begin->tv_sec) * (s64) 1000000000 + end->tv_nsec - begin->tv_nsec; }
 
@@ -124,7 +126,7 @@ perf_loop(void *data)
   struct perf_proto *p = data;
 
   const uint N = 1U << p->exp;
-  const uint offset = sizeof(net_addr) + RTA_MAX_SIZE;
+  const uint offset = perf_random_routes_size;
 
   if (!p->run) {
     ASSERT(p->data == NULL);
@@ -135,36 +137,40 @@ perf_loop(void *data)
 
   ip_addr gw = random_gw(&p->ifa->prefix);
 
-  struct timespec ts_begin, ts_generated, ts_rte, ts_update, ts_withdraw;
+  struct timespec ts_begin, ts_generated, ts_update, ts_withdraw;
 
   clock_gettime(CLOCK_MONOTONIC, &ts_begin);
+
+  struct rta *a = NULL;
 
   for (uint i=0; i<N; i++) {
     struct perf_random_routes *prr = p->data + offset * i;
     *((net_addr_ip4 *) &prr->net) = random_net_ip4();
 
-    rta *a = &prr->a;
-    bzero(a, RTA_MAX_SIZE);
+    if (!p->attrs_per_rte || !(i % p->attrs_per_rte)) {
+      a = &prr->a;
+      bzero(a, RTA_MAX_SIZE);
 
-    a->src = p->p.main_source;
-    a->source = RTS_PERF;
-    a->scope = SCOPE_UNIVERSE;
-    a->dest = RTD_UNICAST;
+      a->src = p->p.main_source;
+      a->source = RTS_PERF;
+      a->scope = SCOPE_UNIVERSE;
+      a->dest = RTD_UNICAST;
 
-    a->nh.iface = p->ifa->iface;
-    a->nh.gw = gw;
-    a->nh.weight = 1;
-  }
+      a->nh.iface = p->ifa->iface;
+      a->nh.gw = gw;
+      a->nh.weight = 1;
 
-  clock_gettime(CLOCK_MONOTONIC, &ts_generated);
+      if (p->attrs_per_rte)
+	a = rta_lookup(a);
+    }
 
-  for (uint i=0; i<N; i++) {
-    struct perf_random_routes *prr = p->data + offset * i;
-    prr->ep = rte_get_temp(&prr->a);
+    ASSERT(a);
+
+    prr->ep = rte_get_temp(a);
     prr->ep->pflags = 0;
   }
 
-  clock_gettime(CLOCK_MONOTONIC, &ts_rte);
+  clock_gettime(CLOCK_MONOTONIC, &ts_generated);
 
   for (uint i=0; i<N; i++) {
     struct perf_random_routes *prr = p->data + offset * i;
@@ -182,13 +188,12 @@ perf_loop(void *data)
   clock_gettime(CLOCK_MONOTONIC, &ts_withdraw);
 
   s64 gentime = timediff(&ts_begin, &ts_generated);
-  s64 temptime = timediff(&ts_generated, &ts_rte);
-  s64 updatetime = timediff(&ts_rte, &ts_update);
+  s64 updatetime = timediff(&ts_generated, &ts_update);
   s64 withdrawtime = timediff(&ts_update, &ts_withdraw);
 
   if (updatetime NS >= p->threshold_min)
-    PLOG("exp=%u times: gen=%lu temp=%lu update=%lu withdraw=%lu",
-	p->exp, gentime, temptime, updatetime, withdrawtime);
+    PLOG("exp=%u times: gen=%ld update=%ld withdraw=%ld",
+	p->exp, gentime, updatetime, withdrawtime);
 
   if (updatetime NS < p->threshold_max)
     p->stop = 0;
@@ -267,6 +272,7 @@ perf_init(struct proto_config *CF)
   p->repeat = cf->repeat;
   p->keep = cf->keep;
   p->mode = cf->mode;
+  p->attrs_per_rte = cf->attrs_per_rte;
 
   switch (p->mode) {
     case PERF_MODE_IMPORT:

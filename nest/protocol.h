@@ -630,6 +630,7 @@ void *channel_config_new(const struct channel_class *cc, const char *name, uint 
 void *channel_config_get(const struct channel_class *cc, const char *name, uint net_type, struct proto_config *proto);
 int channel_reconfigure(struct channel *c, struct channel_config *cf);
 
+void reload_all(void);
 
 /* Moved from route.h to avoid dependency conflicts */
 static inline void rte_update(struct proto *p, const net_addr *n, rte *new) { rte_update2(p->main_channel, n, new, p->main_source); }

@@ -1,7 +1,11 @@
 #!/bin/bash -e
 ##########################################################################
 
+date=$(date +%y%m%d)
 version='2.0.7'
+
+git tag -a "burble-${version}-${date}" -m "burble.dn42 build ${version}/${date}"
+git push --tags
 
 # configure
 
@@ -20,8 +24,6 @@ fi
 make -j4
 
 # create debian package
-
-date=$(date +%y%m%d)
 
 echo "bird-$version for burble.dn42" > description-pak
 sudo checkinstall \

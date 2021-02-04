@@ -143,13 +143,28 @@ static struct nl_sock nl_scan = {.fd = -1};	/* Netlink socket for synchronous sc
 static struct nl_sock nl_req  = {.fd = -1};	/* Netlink socket for requests */
 
 static void
-nl_open_sock(struct nl_sock *nl)
+nl_open_sock(struct nl_sock *nl, int ext_ack)
 {
   if (nl->fd < 0)
     {
       nl->fd = socket(PF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
       if (nl->fd < 0)
 	die("Unable to open rtnetlink socket: %m");
+
+#ifdef NETLINK_EXT_ACK
+
+      if (ext_ack)
+        {
+          /* enable extended ACK for more detailed error information */
+          const int ack_enable = 1;
+          int so_ok = setsockopt(nl->fd, SOL_NETLINK, NETLINK_EXT_ACK, (void *)&ack_enable, sizeof(ack_enable));
+          if (so_ok < 0)
+            /* failure isn't fatal, it will just mean less debug is available on errors */
+            log(L_WARN "nl_open_sock: Unable to set NETLINK_EXT_ACK: %m");
+        }
+
+#endif
+
       nl->seq = (u32) (current_time() TO_S); /* Or perhaps random_u32() ? */
       nl->rx_buffer = xmalloc(NL_RX_SIZE);
       nl->last_hdr = NULL;
@@ -160,8 +175,8 @@ nl_open_sock(struct nl_sock *nl)
 static void
 nl_open(void)
 {
-  nl_open_sock(&nl_scan);
-  nl_open_sock(&nl_req);
+  nl_open_sock(&nl_scan, 0);
+  nl_open_sock(&nl_req, 1);
 }
 
 static void
@@ -241,6 +256,7 @@ nl_get_reply(struct nl_sock *nl)
 }
 
 static struct tbf rl_netlink_err = TBF_DEFAULT_LOG_LIMITS;
+static void nl_parse_route(struct nl_parse_state *s, struct nlmsghdr *h);
 
 static int
 nl_error(struct nlmsghdr *h, int ignore_esrch)
@@ -256,7 +272,84 @@ nl_error(struct nlmsghdr *h, int ignore_esrch)
   e = (struct nlmsgerr *) NLMSG_DATA(h);
   ec = -e->error;
   if (ec && !(ignore_esrch && (ec == ESRCH)))
+    {
+
+#ifdef NETLINK_EXT_ACK
+
+    /* check if extended error info was provided */
+    if (h->nlmsg_flags & NLM_F_ACK_TLVS)
+      {
+        /* parse the returned route data */
+        struct nl_parse_state s;
+        memset(&s, 0, sizeof(struct nl_parse_state));
+
+        s.pool = nl_linpool;
+        s.scan = 1;  /* required to prevent nl_parse_route rejecting the route data */
+
+        nl_parse_route(&s, &e->msg);
+
+        /* scan eattrs to check if EA_KRT_PREFSRC was set */
+        int krt_prefsrc_found = 0;
+        ip_addr krt_prefsrc;
+
+        struct ea_list *eattrs = s.attrs->eattrs;
+        while(!krt_prefsrc_found && eattrs)
+          {
+            uint i;
+            eattr *attr = eattrs->attrs;
+            for(i=0; i < eattrs->count; i++,attr++)
+              {
+                if (attr->id == EA_KRT_PREFSRC)
+                  {
+                    memcpy(&krt_prefsrc, attr->u.ptr->data, sizeof(ip_addr));
+                    krt_prefsrc_found = 1;
+                    break;
+                  }
+              }
+            eattrs = eattrs->next;
+          }
+
+        /* walk the extended attributes to find the error message */
+        struct nlattr *attr;
+        uint offset = NLMSG_HDRLEN + 4 + NLMSG_ALIGN(e->msg.nlmsg_len);
+        const char *msg = NULL;
+
+        while(!msg && (offset < h->nlmsg_len))
+          {
+            attr = (struct nlattr *)(((char *)h) + offset);
+            if (attr->nla_type == NLMSGERR_ATTR_MSG)
+              {
+                msg = ((const char *)attr + sizeof(struct nlattr));
+                break;
+              }
+            offset += attr->nla_len;
+          }
+
+        if (msg)
+          {
+            if (krt_prefsrc_found)
+              {
+                log_rl(&rl_netlink_err, L_WARN "Netlink Error: %s (%s, net=%N, nexthop=%I, krt_prefsrc=%I)", strerror(ec), msg, s.net->n.addr, s.attrs->nh.gw, krt_prefsrc);
+              }
+            else
+              {
+                log_rl(&rl_netlink_err, L_WARN "Netlink Error: %s (%s, net=%N, nexthop=%I)", strerror(ec), msg, s.net->n.addr, s.attrs->nh.gw);
+              }
+
+            /* exit here */
+            lp_flush(nl_linpool);
+            return ec;
+          }
+
+        /* cleanup */
+        lp_flush(nl_linpool);
+      }
+
+#endif
+
+    /* default generic error if no other info available */
     log_rl(&rl_netlink_err, L_WARN "Netlink: %s", strerror(ec));
+  }
   return ec;
 }
 

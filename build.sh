@@ -2,7 +2,7 @@
 ##########################################################################
 
 date=$(date +%y%m%d)
-version='2.0.7'
+version='2.0.8'
 
 git tag -a "burble-${version}-${date}" -m "burble.dn42 build ${version}/${date}"
 git push --tags

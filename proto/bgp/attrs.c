@@ -118,7 +118,7 @@ bgp_set_attr(ea_list **attrs, struct linpool *pool, uint code, uint flags, uintp
 static inline int
 bgp_put_attr_hdr3(byte *buf, uint code, uint flags, uint len)
 {
-  *buf++ = flags;
+  *buf++ = flags & ~BAF_EXT_LEN;
   *buf++ = code;
   *buf++ = len;
   return 3;

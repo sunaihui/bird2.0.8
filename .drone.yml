@@ -1,0 +1,57 @@
+---
+kind: pipeline
+type: docker
+name: deploy
+
+steps:
+
+ - name: build alpine
+   image: c8n.io/simonburblecom/bird-build:alpine
+   commands:
+    - /build.sh
+
+ - name: build ubuntu
+   image: c8n.io/simonburblecom/bird-build:ubuntu
+   commands:
+    - /build.sh
+
+ - name: upload
+   image: plugins/s3
+   settings:
+     bucket: artifacts
+     access_key:
+       from_secret: MINIO_ACCESS_KEY
+     secret_key:
+       from_secret: MINIO_SECRET_KEY
+     endpoint: https://minio.burble.dn42
+     region: uk-lon3
+     path_style: true
+     source: artifacts/**/*
+     strip_prefix: artifacts/
+     target: /bird/${DRONE_BRANCH}
+
+
+image_pull_secrets:
+ - CONFIG_JSON
+
+---
+kind: secret
+name: CONFIG_JSON
+get:  
+  path: burble.dn42/kv/data/drone/docker
+  name: configjson
+
+---
+kind: secret
+name: MINIO_ACCESS_KEY
+get:
+  path: burble.dn42/kv/data/drone/minio
+  name: ACCESS_KEY
+
+---
+kind: secret
+name: MINIO_SECRET_KEY
+get:
+  path: burble.dn42/kv/data/drone/minio
+  name: SECRET_KEY
+
